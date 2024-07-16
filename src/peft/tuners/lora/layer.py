@@ -83,7 +83,10 @@ class LoraLayer(BaseTunerLayer):
         elif base_layer.__class__.__name__ == "EetqLinear":
             # Eetq layers
             in_features, out_features = base_layer.in_features, base_layer.out_features
-        elif hasattr(base_layer, "W_q") and base_layer.__class__.__name__ in ["HQQLinear", "HQQLinearTorchWeightOnlynt4"]:
+        elif hasattr(base_layer, "W_q") and base_layer.__class__.__name__ in [
+            "HQQLinear",
+            "HQQLinearTorchWeightOnlynt4",
+        ]:
             # HQQ layers
             in_features, out_features = base_layer.in_features, base_layer.out_features
         else:
