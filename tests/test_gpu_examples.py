@@ -57,7 +57,8 @@ from peft import (
     prepare_model_for_kbit_training,
     replace_lora_weights_loftq,
 )
-from peft.utils import SAFETENSORS_WEIGHTS_NAME
+from peft.tuners import boft
+from peft.utils import SAFETENSORS_WEIGHTS_NAME, infer_device
 from peft.utils.loftq_utils import NFQuantizer
 from peft.utils.other import fsdp_auto_wrap_policy
 
@@ -68,6 +69,7 @@ from .testing_utils import (
     require_bitsandbytes,
     require_eetq,
     require_hqq,
+    require_non_cpu,
     require_optimum,
     require_torch_gpu,
     require_torch_multi_gpu,
@@ -1378,7 +1380,7 @@ class PeftGPTQGPUTests(unittest.TestCase):
         assert n_total_default == n_total_other
 
 
-@require_torch_gpu
+@require_non_cpu
 class OffloadSaveTests(unittest.TestCase):
     def setUp(self):
         self.causal_lm_model_id = "gpt2"
@@ -1423,7 +1425,6 @@ class OffloadSaveTests(unittest.TestCase):
         assert torch.allclose(output, offloaded_output, atol=1e-5)
 
     @pytest.mark.single_gpu_tests
-    @require_torch_gpu
     def test_offload_merge(self):
         r"""
         Test merging, unmerging, and unloading of a model with CPU- and disk- offloaded modules.
@@ -1470,6 +1471,7 @@ class OffloadSaveTests(unittest.TestCase):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires a GPU")
+@pytest.mark.single_gpu_tests
 class TestPiSSA:
     r"""
     Tests for PiSSA to ensure that it reduces the quantization error compared to normal LoRA quantization.
@@ -1656,7 +1658,9 @@ class TestPiSSA:
         assert model_loaded.base_model.model.linear.lora_A["default"].weight.shape[0] == 8
 
         # save the model with conversion
-        peft_model.save_pretrained(tmp_path / "pissa-model-converted", convert_mutated_to_lora=tmp_path / "init-model")
+        peft_model.save_pretrained(
+            tmp_path / "pissa-model-converted", path_initial_model_for_weight_conversion=tmp_path / "init-model"
+        )
         model_converted = PeftModel.from_pretrained(deepcopy(model), tmp_path / "pissa-model-converted")
         output_converted = model_converted(data)[0]
 
@@ -1672,6 +1676,7 @@ class TestPiSSA:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires a GPU")
+@pytest.mark.single_gpu_tests
 class TestOLoRA:
     r"""
     Tests for OLoRA to ensure that it reduces the quantization error compared to normal LoRA quantization.
@@ -2103,6 +2108,45 @@ class TestLoftQ:
             torch.cuda.empty_cache()
         gc.collect()
 
+    def test_replace_lora_weights_with_local_model(self):
+        # see issue 2020
+        torch.manual_seed(0)
+        model_id = "hf-internal-testing/tiny-random-OPTForCausalLM"
+        device = "cuda"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # save base model locally
+            model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
+            model.save_pretrained(tmp_dir)
+            del model
+
+            # load in 4bit
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+            )
+
+            # load the base model from local directory
+            model = AutoModelForCausalLM.from_pretrained(tmp_dir, quantization_config=bnb_config)
+            model = get_peft_model(model, LoraConfig())
+
+            # passing the local path directly works
+            replace_lora_weights_loftq(model, model_path=tmp_dir)
+            del model
+
+            # load the base model from local directory
+            model = AutoModelForCausalLM.from_pretrained(tmp_dir, quantization_config=bnb_config)
+            model = get_peft_model(model, LoraConfig())
+
+            # when not passing, ensure that users are made aware of the `model_path` argument
+            with pytest.raises(ValueError, match="model_path"):
+                replace_lora_weights_loftq(model)
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
 
 @require_bitsandbytes
 @require_torch_gpu
@@ -2114,7 +2158,7 @@ class MultiprocessTester(unittest.TestCase):
             run_command(cmd, env=os.environ.copy())
 
 
-@require_torch_gpu
+@require_non_cpu
 class MixedPrecisionTests(unittest.TestCase):
     def setUp(self):
         self.causal_lm_model_id = "facebook/opt-125m"
@@ -2976,8 +3020,10 @@ class SimpleConv2DModel(torch.nn.Module):
         return conv_output
 
 
-@require_torch_gpu
+@require_non_cpu
 class TestAutoCast(unittest.TestCase):
+    device = infer_device()
+
     # This test makes sure, that Lora dtypes are consistent with the types
     # infered by torch.autocast under tested PRECISIONS
     @parameterized.expand(PRECISIONS)
@@ -3023,16 +3069,18 @@ class TestAutoCast(unittest.TestCase):
 
     def _test_model(self, model, precision):
         # Move model to GPU
-        model = model.cuda()
+        model = model.to(self.device)
 
         # Prepare dummy inputs
-        input_ids = torch.randint(0, 1000, (2, 10)).cuda()
+        input_ids = torch.randint(0, 1000, (2, 10)).to(self.device)
         if precision == torch.bfloat16:
-            if not torch.cuda.is_bf16_supported():
+            is_xpu = self.device == "xpu"
+            is_cuda_bf16 = self.device == "cuda" and torch.cuda.is_bf16_supported()
+            if not (is_xpu or is_cuda_bf16):
                 self.skipTest("Bfloat16 not supported on this device")
 
         # Forward pass with test precision
-        with torch.autocast(enabled=True, dtype=precision, device_type="cuda"):
+        with torch.autocast(enabled=True, dtype=precision, device_type=self.device):
             outputs = model(input_ids)
             assert outputs.dtype == precision
 
@@ -3076,3 +3124,26 @@ class TestFSDPWrap:
         init_process_group(world_size=1, rank=0)
         # check that this does not raise:
         FSDP(model, auto_wrap_policy=fsdp_auto_wrap_policy(model), use_orig_params=False, sync_module_states=True)
+
+
+class TestBOFT:
+    """
+    Test that we can correctly use half-precision models with BOFT.
+    """
+
+    @require_torch_gpu
+    @pytest.mark.single_gpu_tests
+    def test_boft_half_linear(self):
+        # Check that we can use BoFT with model loaded in half precision
+        layer = torch.nn.Linear(160, 160).cuda()
+        layer = boft.layer.Linear(layer, "layer", boft_n_butterfly_factor=2).to(dtype=torch.bfloat16)
+        x = torch.randn(160, 160, device="cuda", dtype=torch.bfloat16)
+        layer(x)  # does not raise
+
+    @require_torch_gpu
+    @pytest.mark.single_gpu_tests
+    def test_boft_half_conv(self):
+        conv = torch.nn.Conv2d(1, 1, 4).cuda()
+        conv = boft.layer.Conv2d(conv, "conv", boft_n_butterfly_factor=2).to(dtype=torch.bfloat16)
+        x = torch.randn(1, 160, 160, device="cuda", dtype=torch.bfloat16)
+        conv(x)  # does not raise

@@ -202,7 +202,15 @@ class ModulesToSaveWrapper(torch.nn.Module):
         # ModuleList, even though their forward methods cannot be called
         forbidden_classes = (torch.nn.ModuleDict, torch.nn.ModuleList, torch.nn.ParameterDict, torch.nn.ParameterList)
         if isinstance(self.original_module, forbidden_classes):
-            cls_name = self.original_module.__class__.__name__
+            cls_name = self.original_module.__class__
+            raise TypeError(f"modules_to_save cannot be applied to modules of type {cls_name}")
+
+        # local import to avoid circular import
+        from peft.tuners.tuners_utils import BaseTunerLayer
+
+        if isinstance(self.original_module, BaseTunerLayer):
+            # e.g. applying modules_to_save to a lora layer makes no sense
+            cls_name = self.original_module.__class__
             raise TypeError(f"modules_to_save cannot be applied to modules of type {cls_name}")
 
     @property
@@ -396,6 +404,12 @@ def _prepare_prompt_learning_config(peft_config, model_config):
         else:
             raise ValueError("Please specify `num_attention_heads` in `peft_config`")
         peft_config.num_attention_heads = num_attention_heads
+
+    # For grouped-query attention, see #1901.
+    if peft_config.peft_type == "PREFIX_TUNING" and "num_key_value_heads" in model_config:
+        num_key_value_heads = model_config["num_key_value_heads"]
+        peft_config.token_dim = peft_config.token_dim // peft_config.num_attention_heads * num_key_value_heads
+        peft_config.num_attention_heads = num_key_value_heads
 
     if getattr(peft_config, "encoder_hidden_size", None) is None:
         setattr(peft_config, "encoder_hidden_size", peft_config.token_dim)
